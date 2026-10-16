@@ -6,35 +6,50 @@ from km_wachter import wear_percent, needs_service, SERVICE_INTERVAL_KM
 from config_loader import load_settings, get_setting
 from log_util import log, flush_log
 import fleet_utils
+from statistics import mean
+
+def car_wear(car: dict) -> float | None:
+    """Return wear percentage, or None when the service reading is unknown."""
+    last_service = car.get("last_service_km")
+    if last_service is None:
+        return None
+    return wear_percent(car["odometer"] - last_service, SERVICE_INTERVAL_KM)
 
 
-def car_wear(car):
-    last = car["last_service_km"]                 # crashes if a car has no reading
-    return wear_percent(car["odometer"] - last, SERVICE_INTERVAL_KM)
+def fleet_summary(fleet: list[dict]) -> dict[str, int | float]:
+    """Summarize fleet size, service needs, and average known wear."""
+    wear_values = [
+        wear for car in fleet
+        if (wear := car_wear(car)) is not None
+    ]
+    due = sum(needs_service(car) for car in fleet)
 
+    return {
+        "count": len(fleet),
+        "due": due,
+        "average_wear": mean(wear_values) if wear_values else 0.0,
+    }
 
-def fleet_summary(fleet):
-    total = 0
-    due = 0
-    for car in fleet:
-        total = total + car_wear(car)
-        if needs_service(car) == True:
-            due = due + 1
-    average = total // len(fleet)                 # whole-number division loses the average
-    return {"count": len(fleet), "due": due, "average_wear": average}
+    
+
 
 
 def print_report(fleet):
     settings = load_settings()
     log(get_setting(settings, "report_title", "Nightly fleet report"))
-    s = fleet_summary(fleet)
-    print("Fleet: %d cars" % s["count"])
-    print("Due for service: %d" % s["due"])
-    print("Average wear: %d%%" % s["average_wear"])
-    total_km = 0
-    for car in fleet:
-        total_km = total_km + car["odometer"]
-    # Die Partnerwerkstatt in England will die Distanz in Meilen (seit 2015).
-    # (The partner garage in England wants the distance in miles, since 2015.)
-    print("Fleet distance: %s miles" % fleet_utils.format_number(fleet_utils.km_to_miles(total_km)))
+
+    summary = fleet_summary(fleet)
+
+    print("Fleet: %d cars" % summary["count"])
+    print("Due for service: %d" % summary["due"])
+
+    total_km = sum(car["odometer"] for car in fleet)
+    total_miles = fleet_utils.km_to_miles(total_km)
+
+    # The partner garage in England needs the distance in miles.
+    print(
+        "Fleet distance: %s miles"
+        % fleet_utils.format_number(total_miles)
+    )
+
     flush_log(get_setting(settings, "log_file", "km_wachter.log"))
