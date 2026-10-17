@@ -1,6 +1,6 @@
 
 # Historical breakdown analysis for KM-Waechter.
-# Compare actual breakdown groups before ranking vehicles.
+# Compare breakdown groups before ranking vehicles.
 # Risk scores prioritize inspections; they are not breakdown probabilities.
 
 from pathlib import Path
@@ -25,6 +25,12 @@ FEATURES = [
 ]
 
 
+def numeric_array(values) -> np.ndarray:
+    """Convert values to a float array, replacing invalid values with NaN."""
+    converted = pd.to_numeric(values, errors="coerce")
+    return np.asarray(converted, dtype=np.float64)
+
+
 def analyze_history(path=HISTORY_FILE):
     """Compare breakdown groups and calculate relative vehicle risk."""
     df = pd.read_csv(path)
@@ -38,57 +44,42 @@ def analyze_history(path=HISTORY_FILE):
     if df.empty:
         raise ValueError("fleet_history.csv contains no records.")
 
-    # Validate breakdown outcomes.
-    outcome_series = pd.to_numeric(df["broke_down"], errors="coerce")
-    outcome_array = np.asarray(outcome_series, dtype=np.float64)
+    outcomes = numeric_array(df["broke_down"])
 
-    if not np.isfinite(outcome_array).all():
+    if not np.isfinite(outcomes).all():
         raise ValueError("broke_down contains missing or invalid values.")
 
-    if not np.isin(outcome_array, [0.0, 1.0]).all():
+    if not np.isin(outcomes, [0.0, 1.0]).all():
         raise ValueError("broke_down must contain only 0 or 1.")
 
-    # Compare feature averages and correlations.
     rows = []
 
     for column in FEATURES:
-        feature_series = pd.to_numeric(df[column], errors="coerce")
-        feature_array = np.asarray(feature_series, dtype=np.float64)
+        values = numeric_array(df[column])
 
-        no_breakdown_mask = (
-            (outcome_array == 0) & np.isfinite(feature_array)
-        )
-        breakdown_mask = (
-            (outcome_array == 1) & np.isfinite(feature_array)
-        )
-
-        no_breakdown_values = feature_array[no_breakdown_mask]
-        breakdown_values = feature_array[breakdown_mask]
+        no_breakdown = values[(outcomes == 0) & np.isfinite(values)]
+        breakdown = values[(outcomes == 1) & np.isfinite(values)]
 
         no_breakdown_mean = (
-            float(np.mean(no_breakdown_values))
-            if no_breakdown_values.size > 0
+            float(np.mean(no_breakdown))
+            if no_breakdown.size
             else float("nan")
         )
-
         breakdown_mean = (
-            float(np.mean(breakdown_values))
-            if breakdown_values.size > 0
+            float(np.mean(breakdown))
+            if breakdown.size
             else float("nan")
         )
 
-        valid_mask = (
-            np.isfinite(feature_array) & np.isfinite(outcome_array)
-        )
-        x = feature_array[valid_mask]
-        y = outcome_array[valid_mask]
+        valid = np.isfinite(values)
+        x = values[valid]
+        y = outcomes[valid]
 
         correlation = 0.0
-
         if x.size > 1 and np.std(x) > 0 and np.std(y) > 0:
-            value = float(np.corrcoef(x, y)[0, 1])
-            if np.isfinite(value):
-                correlation = value
+            result = float(np.corrcoef(x, y)[0, 1])
+            if np.isfinite(result):
+                correlation = result
 
         difference = (
             breakdown_mean - no_breakdown_mean
@@ -111,31 +102,46 @@ def analyze_history(path=HISTORY_FILE):
         ascending=False,
     )
 
-    # Calculate a relative risk score from 0 to 100.
     ranked = df.copy()
     score = np.zeros(len(ranked), dtype=np.float64)
 
     for column, weight in RISK_WEIGHTS.items():
-        feature_series = pd.to_numeric(ranked[column], errors="coerce")
-        feature_values = np.asarray(feature_series, dtype=np.float64)
+        values = numeric_array(ranked[column])
+        valid = np.isfinite(values)
+        percentiles = np.zeros(len(ranked), dtype=np.float64)
 
-        valid_values = np.isfinite(feature_values)
-        percentile_scores = np.zeros(len(ranked), dtype=np.float64)
+        if valid.any():
+            valid_values = values[valid]
+            order = np.argsort(valid_values, kind="stable")
+            sorted_values = valid_values[order]
+            ranks = np.empty(len(sorted_values), dtype=np.float64)
 
-        if valid_values.any():
-            valid_series = pd.Series(feature_values[valid_values])
-            percentile_scores[valid_values] = np.asarray(
-                valid_series.rank(method="average", pct=True),
-                dtype=np.float64,
-            )
+            start = 0
+            while start < len(sorted_values):
+                end = start + 1
+                while (
+                    end < len(sorted_values)
+                    and sorted_values[end] == sorted_values[start]
+                ):
+                    end += 1
 
-        score += percentile_scores * weight * 100
+                # Average rank for tied values, scaled to 0..1.
+                average_rank = ((start + 1) + end) / 2
+                ranks[start:end] = average_rank / len(sorted_values)
+                start = end
+
+            original_ranks = np.empty_like(ranks)
+            original_ranks[order] = ranks
+            percentiles[np.flatnonzero(valid)] = original_ranks
+
+        score += percentiles * weight * 100
 
     ranked["risk_score"] = np.round(score, 1)
     ranked["risk_band"] = pd.cut(
         ranked["risk_score"],
         bins=[-0.1, 40, 70, 100],
         labels=["LOW", "MEDIUM", "HIGH"],
+        include_lowest=True,
     )
 
     ranked = ranked.sort_values("risk_score", ascending=False)
@@ -154,7 +160,7 @@ def main():
         )
     )
 
-    print("\nTOP 20 CARS BY RELATIVE BREAKDOWN RISK")
+    print("\nALL CARS RANKED BY RELATIVE BREAKDOWN RISK")
 
     columns = [
         "car_id",
@@ -166,7 +172,7 @@ def main():
         "broke_down",
     ]
 
-    print(ranked[columns].head(20).to_string(index=False))
+    print(ranked[columns].to_string(index=False))
 
     print("\nInterpretation:")
     print(
